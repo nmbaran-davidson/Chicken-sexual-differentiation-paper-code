@@ -1,0 +1,399 @@
+---
+title: "Chicken DE Project 2026"
+author: "R. Vincent Mullis"
+date: "2026-01-06"
+output: html_document
+---
+
+```{r, global_options, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, tidy.opts=list(width.cutoff=I(60)), tidy=TRUE) 
+```
+```{r, Installing required packages}
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+install.packages("BiocManager")
+BiocManager::install("DESeq2") #DESeq analysis
+install.packages("ggplot2") #pretty plots
+BiocManager::install("EnhancedVolcano") #volcano plots
+BiocManager::install("clusterProfiler") #gene ontology
+BiocManager::install("GenomicFeatures") #used for DESeq analysis
+install.packages("rio") #easy data manipulation
+install.packages("RColorBrewer") #color palettes
+install.packages("corrplot") #correlation plots
+```
+
+```{r, Loading libraries}
+
+library(EnhancedVolcano) #volcano plots
+library(ggplot2) #pretty plots
+library(DESeq2) #DESeq analysis
+library(tidyverse) #easier plotting/data manipulation
+library(dplyr) #easy data manipulation
+library(GenomicFeatures) #DESeq needs
+library(rio) #easy data manipulation
+library(biomaRt) #genome data source
+library(tibble) #Used for rownames to columns and vice versa function
+library(knitr) #for better knitting
+```
+
+```{r, Reading the gene count matrix CSV into the document}
+
+#The gene count matrix csv file loaded into r
+count_matrix_2026 <- read.csv("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/Expression_Quantification/gene_count_matrix.csv", row.names = 1)
+
+#Also the csv file loaded into r, but I will use this copy to make it so that ONLY ensembl ids appear as rownames
+count_matrix_2026_idsonly <- read.csv("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/Expression_Quantification/gene_count_matrix.csv", row.names = 1)
+
+```
+
+```{r, Creating count_matrix_2026_idsonly, which has just ensembl ids in rownames}
+
+#Creating data frame with count_matrix rownames
+ensembl_ids2026 <- data.frame(rownames(count_matrix_2026))
+
+#Gets rid of the gene symbols by removing everything after the | symbol. 
+ensembl_ids2026$rownames <- sub("\\|.*", "", ensembl_ids2026$rownames.count_matrix_2026.)
+
+#Replaces row names in the count_matrix_2026_idsonly file with ensembl ids
+if (length(ensembl_ids2026$rownames) == nrow(count_matrix_2026_idsonly)) {
+  rownames(count_matrix_2026_idsonly) <- ensembl_ids2026$rownames
+} else {
+  stop("The length of the new gene names does not match the number of rows in the count matrix.")
+}
+```
+
+```{r, Getting gene symbols for ensembl ids and chromosomes for respective genes from biomart}
+******************
+#This creates a data set with all the chicken info from ensembl summoned by biomart. The host is specified so it runs when the main website is down. The version is specified because that's the version the original alignment was done with, and newer versions don't work.
+ensembl <- useEnsembl(biomart = "genes", dataset = "ggallus_gene_ensembl", mirror = "www", host = "https://jun2026.archive.ensembl.org", version = 106)
+
+#Searches the datasets available on biomart for a key term, in this case looking for chicken genome
+searchDatasets(mart = ensembl, pattern = "ggallus")
+
+#Once we've found the dataset we need we can specify this for biomart
+ensembl <- useDataset(dataset = "ggallus_gene_ensembl", mart = ensembl)
+
+#Searches the attributes available on biomart for a key term, we would like the gene symbol
+searchAttributes(mart = ensembl, pattern = "symbol")
+
+#You have to run this twice don't ask me why
+ensembl <- useEnsembl(biomart = "genes", dataset = "ggallus_gene_ensembl", host = "https://useast.ensembl.org")
+
+#Creates data frame with ensembl ids, corresponding gene symbols from uniprot_gn_symbol, and the chromosome each gene is on
+mart_result <- getBM(mart = ensembl, attributes = c("chromosome_name", "uniprot_gn_symbol", "ensembl_gene_id"), filters = "ensembl_gene_id", values = ensembl_ids2026$rownames)
+
+mart_result$symbols_ids <- make.unique(mart_result$symbols_ids)
+
+```
+
+```{r, Assigning gene symbols and ensembl ids to count_matrix_2026_symbid}
+
+#Need to insert NA's into the blank spots of the mart_result data frame for the following code to work
+mart_result[mart_result == ""] <- NA
+#Creating column with both symbols and IDs in the mart_result data frame (for genes without symbols, there will be IDs)
+mart_result$symbols_ids <- ifelse(
+  is.na(mart_result$uniprot_gn_symbol),
+  mart_result$ensembl_gene_id,
+  mart_result$uniprot_gn_symbol)
+
+#Save the mart_result as a tsv for later use in WGCNA
+write.table(mart_result,"~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/mart_result.tsv")
+
+#Turning the rownames of the count_matrix_2025_idsonly into a column
+count_matrix_2026_idsonly <- tibble::rownames_to_column(count_matrix_2026_idsonly, "ensembl_gene_id")
+
+#Merging the count_matrixids only with the mart_result by the ensembl ids and creating the count_matrix_2025_symbid data frame
+count_matrix_2026_symbid <- merge(count_matrix_2026_idsonly, mart_result, by = "ensembl_gene_id")
+
+#Makes all of the columns in the symbols_ids unique by adding .1, .2, etc so that it can be converted to rownames
+count_matrix_2026_symbid$symbols_ids <- make.unique(count_matrix_2026_symbid$symbols_ids)
+
+#Converting the symbols_ids column to rownames
+count_matrix_2026_symbid <- tibble::column_to_rownames(count_matrix_2026_symbid,"symbols_ids")
+
+#Making a copy of the count_matrix with the extra information to use for other analysis
+count_matrix_2026_symbid_copy <- count_matrix_2026_symbid
+#Deleting the extra columns so that this count matrix can be used for DESeq
+count_matrix_2026_symbid$ensembl_gene_id <- NULL
+count_matrix_2026_symbid$chromosome_name <- NULL
+count_matrix_2026_symbid$uniprot_gn_symbol <- NULL
+```
+
+```{r, Reading in the Phenodata csv file}
+
+#The phenodata file containing meta data on samples for differential gene expression purposes
+#Running with sample 9 switched to Saline-ZW
+chicken_phenodata <- read.csv("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/ChickenPhenodata_9ZW_2026.csv", sep = ";")
+
+#Sets the sample names to row names to make it easier to run following checks
+chicken_phenodata <- tibble::column_to_rownames(chicken_phenodata, "sample")
+
+##Checks to make sure deseq can run and the row names are sample IDs matching those of the columns from the count_matrix:
+#Row names of count matrix match column names of sample file?
+all(colnames(count_matrix_2026_symbid) %in% rownames(chicken_phenodata))
+#In the same order?
+all(colnames(count_matrix_2026_symbid) == rownames(chicken_phenodata))
+
+#Re-leveling the data, like setting 'controls' of a sort, to be used in DESEQ later
+chicken_phenodata$Treatment <- factor(chicken_phenodata$Treatment, levels = c("Saline", "Fadrozole"))
+chicken_phenodata$Chromosome <- factor(chicken_phenodata$Chromosome, levels = c("ZZ", "ZW"))
+```
+
+```{r, Creating the DESeq2 dataset object}
+
+#Creating dds object with design meant to capture interaction between chromosome and treatment
+dds2026_data = DESeqDataSetFromMatrix(countData = count_matrix_2026_symbid, #1
+                       colData = chicken_phenodata, #2
+                       design = ~ Chromosome+Treatment + Chromosome:Treatment) #3
+
+#1: Tells R what matrix to draw gene expression data from
+#2: Tells R what data frame to use as the colData, or metadata file, creating subgroups of the columns to compare gene expression between
+#3: This design should look at a the overall differential expression based on chromosome type, treatment type, and whether or not there is an interaction between the two independent variables
+
+#Checking that factor levels are correct
+levels(dds2026_data$Treatment)
+levels(dds2026_data$Chromosome)
+
+#Running DESeq
+dds2026 <- DESeq(dds2026_data)
+
+```
+```{r, Contrasts}
+
+#Looks at the names of the available contrasts created by the DESeq design
+resultsNames(dds2026)
+
+##Main effect of chromosome in saline group
+
+res_chro_sal <- data.frame(results(dds2026, contrast = list("Chromosome_ZW_vs_ZZ")))
+#Sorting out genes differentially expressed with p value less than 0.01
+res_chro_salsig <- as.data.frame(res_chro_sal[!is.na(res_chro_sal$pvalue) & res_chro_sal$pvalue < 0.01,])
+#Creating table with significant genes and their chromosome
+res_chro_salsig <- tibble::rownames_to_column(res_chro_salsig, "symbols_ids")
+res_chro_salsig <- merge(res_chro_salsig, mart_result, by = "symbols_ids")
+#Saving as csv to open in excel
+write.csv(res_chro_salsig, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DGE_Results_2026/res_chro_salsig.csv", row.names = FALSE)
+
+
+##Main effect of chromosome in fadrozole group
+
+res_chro_fad <- data.frame(results(dds2026, contrast = list("Chromosome_ZW_vs_ZZ", "ChromosomeZW.TreatmentFadrozole")))
+#Sorting out genes differentially expressed with p value less than 0.01
+res_chro_fadsig <- as.data.frame(res_chro_fad[!is.na(res_chro_fad$pvalue) & res_chro_fad$pvalue < 0.01,])
+#Creating table with significant genes and their chromosome
+res_chro_fadsig <- tibble::rownames_to_column(res_chro_fadsig, "symbols_ids")
+res_chro_fadsig <- merge(res_chro_fadsig, mart_result, by = "symbols_ids")
+#Saving as csv to open in excel
+write.csv(res_chro_fadsig, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DGE_Results_2026/res_chro_fadsig.csv", row.names = FALSE)
+
+
+##Main effect of treatment in ZZ
+
+res_treat_zz <- data.frame(results(dds2026, contrast = list("Treatment_Fadrozole_vs_Saline")))
+#Sorting out genes differentially expressed with p value less than 0.01
+res_treat_zzsig <- as.data.frame(res_treat_zz[!is.na(res_treat_zz$pvalue) & res_treat_zz$pvalue < 0.01,])
+#Creating table with significant genes and their chromosome
+res_treat_zzsig <- tibble::rownames_to_column(res_treat_zzsig, "symbols_ids")
+res_treat_zzsig <- merge(res_treat_zzsig, mart_result, by = "symbols_ids")
+#Saving as csv to open in excel
+write.csv(res_treat_zzsig, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DGE_Results_2026/res_treat_zzsig.csv", row.names = FALSE)
+
+
+##Main effect of treatment in ZW
+
+res_treat_zw <- data.frame(results(dds2026, contrast = list("Treatment_Fadrozole_vs_Saline", "ChromosomeZW.TreatmentFadrozole")))
+#Sorting out genes differentially expressed with p value less than 0.01
+res_treat_zwsig <- as.data.frame(res_treat_zw[!is.na(res_treat_zw$pvalue) & res_treat_zw$pvalue < 0.01,])
+#Creating table with significant genes and their chromosome
+res_treat_zwsig <- tibble::rownames_to_column(res_treat_zwsig, "symbols_ids")
+res_treat_zwsig <- merge(res_treat_zwsig, mart_result, by = "symbols_ids")
+#Saving as csv to open in excel
+write.csv(res_treat_zwsig, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DGE_Results_2026/res_treat_zwsig.csv", row.names = FALSE)
+
+
+##Interaction
+
+res_int <- data.frame(results(dds2026, contrast = list("ChromosomeZW.TreatmentFadrozole")))
+#Sorting out genes differentially expressed with p value less than 0.01
+res_intsig <- as.data.frame(res_int[!is.na(res_int$pvalue) & res_int$pvalue < 0.01,])
+#Creating table with significant genes and their chromosome
+res_intsig <- tibble::rownames_to_column(res_intsig, "symbols_ids")
+res_intsig <- merge(res_intsig, mart_result, by = "symbols_ids")
+#Saving as csv to open in excel
+write.csv(res_intsig, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DGE_Results_2026/res_intsig.csv", row.names = FALSE)
+
+```
+
+```{r, PCA Plot 2026}
+
+#Creating PCA Object
+pca2026 = vst(dds2025, blind=FALSE)
+
+pca_data2026 <- plotPCA(pca2026, intgroup=c("Chromosome", "Treatment", "Chromosome_Treatment"), returnData=TRUE)
+
+#Calc percent variance
+percent_var2026 <- round(100*attr(pca_data2026,"percentVar"))
+
+#Constructing plot 
+pca_plot <- ggplot(pca_data2026, aes(PC1, PC2))+
+  geom_point(size=4, aes(col=Chromosome_Treatment))+
+  scale_color_manual(values=c("#0D0887FF","#B12A90FF", "#E16462FF","#FCA636FF"))+
+  theme_classic() + theme(
+    legend.position = "none", 
+    axis.title = element_text(size = 8, face = "bold"))+ coord_cartesian(xlim = c(-15, 30)) # Sets x-axis from 2 to 5
+
+#Save PCA plot as a PDF for import into illustrator
+pdf("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/PCA_Plot/PCAplot2026_2.pdf", width = 2.5, height = 2.5)
+par(mar = c(4, 4, 4, 4))
+pca_plot + #ggtitle("Principal Component Analysis (PCA) plot of 4 groups") + 
+  xlab("Feature 1") +
+  ylab("Feature 2")
+dev.off()
+```
+
+```{r, Barplot for chromosome distribution across contrasts}
+
+#Creating data frame with data on how much the chromosomes were represented by each deseq contrast, and up and down regulation, info from excel
+
+#One for the break down of each contrasts
+chromosome_stats <- data.frame(Chrosaldown = c(123, 348, 0), Chrosalup = c(257, 16, 33), Chrofaddown = c(163, 169,0), Chrofadup = c(250, 9, 23), Treatzzdown = c(601, 16, 3), Treatzzup = c(932, 76, 2), Treatzwdown = c(283, 14, 2), Treatzwup = c(407, 26,1), Intdown = c(205, 11, 1), Intup  = c(181, 10, 1))
+
+#Can only make barplots with matrices
+chromosome_stats <- as.matrix(chromosome_stats)
+
+#Saving as a PDF for export to illustrator
+pdf("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DEG_Plots/DEG_Chromosome_Distribution.pdf", width = 4.5, height = 2)
+par(mar = c(1, 4, 1, 1), ps = 8)  #bottom, left, top, right
+barplot(chromosome_stats,
+        ylab = "Total Genes", font.lab = 2, 
+        col = c("#A4CE4C", "#FCA636", "#B12A90FF"),border = NA)
+dev.off()
+```
+
+```{r, Volcano Plots}
+###Making volcano plots showing the log fold change and significance of differentially expressed genes between main four contrasts
+
+##res_chro_sal
+
+#Make a copy of the results table
+copy_res_chro_sal <- res_chro_sal
+
+#Add a column to specify significant UP/DOWN regulation
+copy_res_chro_sal$diffexpressed <- "Non-signficiant"
+copy_res_chro_sal$diffexpressed[copy_res_chro_sal$log2FoldChange > 0.2 & copy_res_chro_sal$pvalue < 0.01] <- "UP"
+copy_res_chro_sal$diffexpressed[copy_res_chro_sal$log2FoldChange < -0.2 & copy_res_chro_sal$pvalue < 0.01] <- "DOWN"
+
+#Create volcano plot
+vol_chrosal <- ggplot(data = copy_res_chro_sal, aes(x = log2FoldChange, y = -log10(pvalue), col = diffexpressed)) +
+  geom_vline(xintercept = c(-0.2, 0.2), col = "gray", linetype = 'dashed') + #the vertical intercept line
+  geom_hline(yintercept = -log10(.01), col = "gray", linetype = 'dashed') + #the horizontal intercept line
+  geom_point(size = 2,  alpha = 0.5) + #the points
+  scale_color_manual(values = c("#1F1BB3", "gray", "#D41159"))+ #the colors of the points
+  coord_cartesian(ylim = c(0, 70), xlim = c(-45, 45)) + #the plot/axis dimensions
+  scale_y_continuous(breaks = seq(0, 70, 20)) + #y axis numbers
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 8, face = "bold"),
+    axis.title.y = element_text(size = 8, face = "bold"))
+
+##res_chro_fad
+
+#Make a copy of the results table
+copy_res_chro_fad <- res_chro_fad
+
+#Add a column to specify UP/DOWN regulation
+copy_res_chro_fad$diffexpressed <- "Non-signficiant"
+copy_res_chro_fad$diffexpressed[copy_res_chro_fad$log2FoldChange > 0.2 & copy_res_chro_fad$pvalue < 0.01] <- "UP"
+copy_res_chro_fad$diffexpressed[copy_res_chro_fad$log2FoldChange < -0.2 & copy_res_chro_fad$pvalue < 0.01] <- "DOWN"
+
+#Create volcano plot
+vol_chrofad <- ggplot(data = copy_res_chro_fad, aes(x = log2FoldChange, y = -log10(pvalue), col = diffexpressed)) +
+  geom_vline(xintercept = c(-0.2, 0.2), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(.01), col = "gray", linetype = 'dashed') +
+  geom_point(size = 2,  alpha = 0.5) +
+  scale_color_manual(values = c("#1F1BB3", "gray", "#D41159")) +
+  coord_cartesian(ylim = c(0, 70), xlim = c(-45, 45)) +
+  scale_x_continuous(breaks = seq(-40, 40, 20)) +
+  scale_y_continuous(breaks = seq(0, 70, 20))+
+  theme_classic()+
+  theme(legend.position = "none", axis.title.x = element_text(size = 8, face = "bold"), axis.title.y = element_blank(), axis.text.y = element_blank(), #remove axis text,
+    axis.ticks.y = element_blank() #remove axis ticks
+  )
+
+##res_treat_zz
+
+#Make a copy of the results table
+copy_res_treat_zz <- res_treat_zz
+
+#Add a column to specify UP/DOWN regulation
+copy_res_treat_zz$diffexpressed <- "Non-signficiant"
+copy_res_treat_zz$diffexpressed[copy_res_treat_zz$log2FoldChange > 0.2 & copy_res_treat_zz$pvalue < 0.01] <- "UP"
+copy_res_treat_zz$diffexpressed[copy_res_treat_zz$log2FoldChange < -0.2 & copy_res_treat_zz$pvalue < 0.01] <- "DOWN"
+
+#Create volcano plot
+vol_treatzz <- ggplot(data = copy_res_treat_zz, aes(x = log2FoldChange, y = -log10(pvalue), col = diffexpressed)) +
+  geom_vline(xintercept = c(-0.2, 0.2), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(.01), col = "gray", linetype = 'dashed') +
+  geom_point(size = 2,  alpha = 0.5) +
+  scale_color_manual(values = c("#1F1BB3", "gray", "#D41159")) +
+  coord_cartesian(ylim = c(0, 70), xlim = c(-45, 45)) + #the plot/axis dimensions
+  scale_x_continuous(breaks = seq(-40, 40, 20)) +
+  scale_y_continuous(breaks = seq(0, 70, 20))+ 
+  theme_classic()+
+  theme(legend.position="none", axis.title.x = element_text(size = 8, face = "bold"), axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+##res_treat_zw
+
+#Make a copy of the results table
+copy_res_treat_zw <- res_treat_zw
+
+#Add a column to specify UP/DOWN regulation
+copy_res_treat_zw$diffexpressed <- "Non-signficiant"
+copy_res_treat_zw$diffexpressed[copy_res_treat_zw$log2FoldChange > 0.2 & copy_res_treat_zw$pvalue < 0.01] <- "UP"
+copy_res_treat_zw$diffexpressed[copy_res_treat_zw$log2FoldChange < -0.2 & copy_res_treat_zw$pvalue < 0.01] <- "DOWN"
+
+#Create volcano plot
+vol_treatzw <- ggplot(data = copy_res_treat_zw, aes(x = log2FoldChange, y = -log10(pvalue), col = diffexpressed)) +
+  geom_vline(xintercept = c(-0.2, 0.2), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(.01), col = "gray", linetype = 'dashed') +
+  geom_point(size = 2,  alpha = 0.5) +
+  scale_color_manual(values = c("#1F1BB3", "gray", "#D41159")) +
+  coord_cartesian(ylim = c(0, 70), xlim = c(-45, 45)) +
+  scale_x_continuous(breaks = seq(-40, 40, 20)) +
+  scale_y_continuous(breaks = seq(0, 70, 20))+
+  theme_classic()+
+  theme(
+    legend.position = "none", 
+    axis.title.x = element_text(size = 8, face = "bold"), axis.title.y = element_blank(), axis.text.y = element_blank(), #remove y axis text,
+    axis.ticks.y = element_blank()) #remove y axis tics
+show(vol_treatzw)
+
+#Save as one combined PDF for export to illustrator
+pdf("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/DEG_Plots/Volcanos_Plots_2026.pdf", width = 7, height = 2)
+par(ps = 8)
+(vol_chrosal | vol_chrofad | vol_treatzz | vol_treatzw)
+dev.off()
+
+```
+
+```{r, WGCNA preperation}
+
+#Enable multi-threading for WGCNA (adjust based on your system)
+enableWGCNAThreads(nThreads = 8)
+
+#Normalization 
+
+#Using the deseq dataset already created to use the deseq package normalization function
+dds2026_data[rowSums(counts(dds2026_data)>=15)>=24]
+#Variacne stablization
+dds_norm <- vst(dds2026_data)
+#Normalized Counts
+norm_counts <- assay(dds_norm)
+norm_counts <- as.data.frame(norm_counts)
+norm_counts <- tibble::rownames_to_column(norm_counts, "Genes")
+#Save as a csv for import into WGCNA R mark down file
+write.table(norm_counts, file = "normalized_counts.csv", sep = ",", col.names = TRUE, quote = FALSE)
+
+```

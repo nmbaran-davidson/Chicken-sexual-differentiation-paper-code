@@ -1,0 +1,852 @@
+---
+title: "WGCNA"
+author: "R. Vincent Mullis"
+date: "2026-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+FYI:
+I did this analysis using this guide:
+https://ngs101.com/how-to-build-gene-co-expression-networks-from-rna-seq-data-using-wgcna-complete-step-by-step-guide-for-absolute-beginners/
+by Lei Guo, who also has tutorials available on youtube.
+The source data used in this file is pulled from files previously created in the Differential Expression R markdown file.
+
+```{r, libraries}
+library(ggplot2) #pretty plots
+library(ggrepel) #pretty plots with nice labels
+library(WGCNA) #for wgcna
+library(pheatmap) #for heatmaps
+library(reshape2)
+library(igraph)
+library(STRINGdb)
+library(tibble)
+library(tidygraph) #for hubgene plot
+library(ggraph) #for hubgene plot
+library(purrr) #for chrom dist plot
+```
+```{r, Loading in Pre-processed RNA-seq Data}
+
+#Loading normalized expression data
+#Rows are genes, columns are samples
+norm_counts <- read.csv("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/normalized_counts.csv", header = TRUE)
+rownames(norm_counts) <- NULL
+norm_counts <- tibble::column_to_rownames(norm_counts, "Genes")
+
+#Loading sample information
+#Contains treatment/chromosome information for each sample
+chicken_phenodata <- read.csv("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/ChickenPhenodata_9ZW_2026.csv", sep = ";")
+chicken_phenodata <- tibble::column_to_rownames(chicken_phenodata, "sample")
+#relevel the chicken_phenodata columns
+chicken_phenodata$Chromosome <- factor(chicken_phenodata$Chromosome, levels =c("ZZ", "ZW"))
+chicken_phenodata$Treatment <- factor(chicken_phenodata$Treatment, levels =c("Saline", "Fadrozole"))
+chicken_phenodata$Chromosome_Treatment <- factor(chicken_phenodata$Chromosome_Treatment, levels =c("SZZ", "SZW", "FZZ", "FZW"))
+#Creating an abbreviated version for later use in figure making
+chicken_phenodata_ab <- chicken_phenodata %>%
+  rename(Chrom = Chromosome) %>%
+  rename(Treat = Treatment) %>%
+  mutate(Treat = case_when(
+    Treat == "Fadrozole" ~ "Fad",
+    Treat == "Saline" ~ "Sal",
+    TRUE ~ Treat
+  ))
+
+#Loading gene annotation data
+#Contains ensembl ids and gene symbols
+gene_data <- read.table("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/mart_result.tsv")
+
+#Enable multi-threading for WGCNA
+enableWGCNAThreads(nThreads = 8)
+```
+
+
+```{r, WGCNA Quality control and data filtering}
+
+#Check for missing values
+missing_count <- sum(is.na(norm_counts))
+cat("Number of missing values:", missing_count, "\n")
+#0 (7/28/26)
+
+#Remove genes with missing values if any
+if (missing_count > 0) {
+  expr_data <- expr_data[complete.cases(expr_data), ]
+  cat("Removed genes with missing values. New dimension:", dim(expr_data), "\n")
+}
+
+#Calculate variance for each gene
+gene_variance <- apply(norm_counts, 1, var)
+
+#I once had a plan to make all the figures using ggplot for consistency... this idea was quickly abandoned, but that's why some of these are done with ggplot instead of base r:
+
+#Prepare data
+var_log <- log10(gene_variance)
+var_log <- var_log[is.finite(var_log)]
+gene_variance_gg <- data.frame(var = var_log)
+cutoff <- log10(quantile(gene_variance, 0.4, na.rm = TRUE))
+
+gene_variance_distribution <- ggplot(gene_variance_gg, aes(x = var)) +
+  geom_histogram(
+    bins = 50,
+    fill = "lightblue",
+    color = "white"
+  ) +
+  geom_vline(
+    aes(xintercept = cutoff, color = "40th percentile cutoff"),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  scale_color_manual(values = c("40th percentile cutoff" = "red")) +
+  labs(
+    title = "Distribution of Gene Variance (log10)",
+    x = "log10(Variance)",
+    y = "Frequency",
+    color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = c(0.98, 0.98),
+    legend.justification = c(1, 1),
+    legend.background = element_blank(),
+    legend.key = element_blank()
+  )
+#Check plot before saving
+show(gene_variance_distribution)
+#Save
+ggsave(
+  "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Gene_Variance_Distribution.png",
+  plot = gene_variance_distribution,
+  width = 8,
+  height = 6,
+  dpi = 100
+)
+
+#Remove genes with very low variance (bottom 40%)
+#(These genes provide little information for co-expression analysis)
+variance_threshold <- quantile(gene_variance, 0.4)
+cat("Variance threshold (40th percentile):", variance_threshold, "\n")
+#0.01505024 (7/28/26)
+ 
+norm_counts_filtered <- norm_counts[gene_variance > variance_threshold, ]
+cat("Genes after variance filtering:", nrow(norm_counts_filtered), "\n")
+#14706 (7/28/26)
+ 
+#Transpose for WGCNA (samples as rows, genes as columns)
+expr_matrix <- t(norm_counts_filtered)
+ 
+#Check sample clustering to identify outliers
+sample_tree <- hclust(dist(expr_matrix), method = "average")
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Sample_Clustering_Outliers.png", width = 1200, height = 600, res = 100)
+par(mar = c(2, 5, 2, 2))
+plot(sample_tree, 
+     main = "Sample Clustering to Detect Outliers",
+     sub = "Height represents dissimilarity between samples",
+     xlab = "", 
+     cex = 0.7)
+abline(h = 200, col = "red", lty = 2, lwd = 2)
+dev.off()
+```
+
+```{r,Background Genes}
+#Saving the 'background genes' for GO Term Analysis
+background_genes <- colnames(expr_matrix)
+write.csv(background_genes, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/Background_genes.csv")
+```
+
+```{r, WGCNA Prepare trait data matrix}
+
+#Create binary trait matrix for each experimental condition
+#Each column represents presence (1) or absence (0) of that condition
+trait_data <- data.frame(
+  Fadrozole = as.numeric(chicken_phenodata$Treatment == "Fadrozole"),
+  Saline = as.numeric(chicken_phenodata$Treatment == "Saline"),
+  ZW = as.numeric(chicken_phenodata$Chromosome == "ZW"),
+  ZZ = as.numeric(chicken_phenodata$Chromosome == "ZZ")
+)
+#Set row names to match expression matrix
+rownames(trait_data) <- rownames(expr_matrix)
+#Verify that sample names match between expression and trait data
+if (!all(rownames(expr_matrix) == rownames(trait_data))) {
+  stop("ERROR: Sample names don't match between expression and trait data!")
+}
+
+#Creating the trait data matrix for looking at specific interactions
+trait_data_int <- binarizeCategoricalColumns(chicken_phenodata$Chromosome_Treatment, includePairwise = TRUE, includeLevelVsAll = FALSE, minCount = 1)
+#Reordering the columns for more intuitive reading
+trait_data_int <- trait_data_int[,c(
+  "data.SZW.vs.SZZ",
+  "data.FZW.vs.FZZ",
+  "data.FZZ.vs.SZZ",
+  "data.FZW.vs.SZW",
+  "data.FZZ.vs.SZW",
+  "data.FZW.vs.SZZ" 
+)]
+#Renaming the columns for more intuitive reading
+colnames(trait_data_int) <- c(
+  "SZZ vs SZW",
+  "FZZ vs FZW",
+  "SZZ vs FZZ",
+  "SZW vs FZW",
+  "SZW vs FZZ",
+  "SZZ vs FZW"
+)
+#Set row names to match expression matrix
+rownames(trait_data_int) <- colnames(norm_counts)
+#Verify that sample names match between expression and trait data
+if (!all(colnames(norm_counts) == rownames(trait_data_int))) {
+  stop("ERROR: Sample names don't match between expression and trait data!")
+}
+```
+```{r, Verify Data Structure}
+
+#Visualize expression data distribution
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Expression_Data_Distribution.png", width = 1200, height = 600, res = 100)
+par(mfrow = c(1, 2))
+ 
+#Overall distribution
+hist(as.matrix(expr_matrix), 
+     breaks = 100, 
+     main = "Distribution of Expression Values",
+     sub = "Should be roughly normal for VST/rlog data",
+     xlab = "Expression Value",
+     col = "lightblue",
+     border = "white")
+ 
+#Sample distributions (boxplot)
+boxplot(expr_matrix[, sample(1:ncol(expr_matrix), min(20, ncol(expr_matrix)))], 
+        main = "Sample Expression Distributions\n(20 random genes)",
+        xlab = "Genes",
+        ylab = "Expression Value",
+        las = 2,
+        cex.axis = 0.6,
+        col = "lightblue",
+        border = "gray40")
+ 
+par(mfrow = c(1, 1))
+dev.off()
+
+```
+
+```{r, Choosing Soft-Thresholding Power}
+
+#Calculate network topology for various soft-thresholding powers
+powers <- c(seq(1, 10, by = 1), seq(12, 20, by = 2))
+ 
+#This function tests different power values
+sft <- pickSoftThreshold(
+  expr_matrix,
+  powerVector = powers,
+  networkType = "signed",
+  verbose = 3,
+  randomSeed = 4444 # (7/28/26) setting a seed so we get consistent modules to use in analysis
+)
+ 
+#Plot scale-free topology fit index as a function of power
+par(mfrow = c(1, 2))
+ 
+#Scale-free topology fit
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Soft_Thresholding_Power_Selection.png", width = 1200, height = 600, res = 100)
+par(mfrow = c(1, 2))
+ 
+#Scale-free topology fit
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     main = "Scale Independence",
+     type = "n")
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, 
+     cex = 0.9, 
+     col = "red")
+abline(h = 0.85, col = "red", lty = 2)
+ 
+#Mean connectivity
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     main = "Mean Connectivity",
+     type = "n")
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers, 
+     cex = 0.9, 
+     col = "red")
+ 
+par(mfrow = c(1, 1))
+dev.off()
+ 
+#Choose the power: first value that reaches plateau in scale-free topology and gives reasonable mean connectivity
+soft_power <- sft$powerEstimate
+if (is.na(soft_power)) {
+  soft_power <- 6  # Use 6 as default if automatic selection fails
+  cat("Warning: Automatic power selection failed. Using default power =", soft_power, "\n")
+} else {
+  cat("Selected soft-thresholding power:", soft_power, "\n")
+}
+#14 (3/13/26), 12 (7/28/26)
+
+```
+
+```{r, Construct Network and Identify Modules}
+
+#CRITICAL: Fix for WGCNA cor() function bug
+#WGCNA has its own cor() function that conflicts with stats::cor()
+cor <- WGCNA::cor
+ 
+#Setting a seed for consistent results
+#set.seed(4444)
+#One-step network construction and module detection
+net <- blockwiseModules(
+  expr_matrix,
+  power = soft_power,
+  networkType = "signed",
+  TOMType = "signed",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "Chicken_TOM",
+  verbose = 3, 
+  randomSeed = 4444 # (7/28/26) setting a seed so we get consistent modules to use in analysis
+)
+ 
+#Restore the standard cor() function after network construction
+cor <- stats::cor
+ 
+#Convert numeric module labels to colors for visualization
+module_colors <- labels2colors(net$colors)
+ 
+#Count genes in each module
+module_table <- table(module_colors)
+cat("\nNumber of modules identified:", length(unique(module_colors)) - 1, "\n")
+#Number of modules identified: 25 (3/11/26), 23 (7/28/26)
+print(module_table)
+#black blue brown cyan
+#580   1578 1411  300
+ 
+#Plot the dendrogram with module colors
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Gene_Dendrogram_Modules.png", width = 1200, height = 800, res = 100)
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  module_colors[net$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05,
+  main = "Gene Dendrogram and Module Colors"
+)
+dev.off()
+```
+
+```{r, Calculate and Visualize Module Eigengenes}
+
+#Extract module eigengenes
+module_eigengenes <- net$MEs
+
+#Making the modules named by color
+module_eigengenes <- moduleEigengenes(expr_matrix, module_colors)$eigengenes
+
+#Reorder modules by hierarchical clustering of eigengenes
+module_eigengenes <- orderMEs(module_eigengenes)
+ 
+#Visualize module eigengenes across samples
+#Create a heatmap showing how each module's expression varies across samples
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Module_Eigengenes_Heatmap.png", width = 1200, height = 1000, res = 100)
+pheatmap(
+  t(module_eigengenes),
+  scale = "row",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "average",
+  annotation_col = trait_data,
+  show_colnames = FALSE,
+  main = "Module Eigengenes Across Samples",
+  color = colorRampPalette(c("#1F1BB3", "white", "#D41159"))(50),
+  fontsize = 8
+)
+dev.off()
+```
+```{r, Module-trait Association Analysis}
+
+#Calculating correlations between treatment and chromosomal sex
+#Calculate correlations between module eigengenes and traits
+module_trait_cor <- cor(module_eigengenes, trait_data, use = "pairwise.complete.obs")
+
+#Calculate p-values for these correlations
+nSamples <- nrow(expr_matrix)
+module_trait_pvalue <- corPvalueStudent(module_trait_cor, nSamples)
+ 
+#Create a text matrix for the heatmap
+#Format: correlation coefficient (p-value)
+textMatrix <- paste(signif(module_trait_cor, 2), "\n(",
+                    signif(module_trait_pvalue, 1), ")", sep = "")
+dim(textMatrix) <- dim(module_trait_cor)
+ 
+#Visualize module-trait relationships with a heatmap
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Module_Trait_Relationships.png", width = 1200, height = 1000, res = 100)
+par(mar = c(8, 10, 3, 3))
+labeledHeatmap(
+  Matrix = module_trait_cor,
+  xLabels = names(trait_data),
+  yLabels = names(module_eigengenes),
+  ySymbols = names(module_eigengenes),
+  colorLabels = TRUE,
+  xColorLabels = TRUE,
+  colors = colorRampPalette(c("#1F1BB3", "white", "#D41159"))(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.5,
+  zlim = c(-1, 1),
+  main = "Module-Trait Relationships"
+)
+dev.off()
+
+#Calculating correlation between treatment and chromosomal sex interactions
+#Calculate correlations between module eigengenes and traits
+module_trait_cor_int <- cor(module_eigengenes, trait_data_int, use = "pairwise.complete.obs")
+
+#Calculate p-values for these correlations
+module_trait_pvalue_int <- corPvalueStudent(module_trait_cor_int, nSamples)
+
+#Create a text matrix for the heatmap
+#Format: correlation coefficient (p-value)
+textMatrix_int <- paste(signif(module_trait_cor_int, 2), "\n(",
+                    signif(module_trait_pvalue_int, 1), ")", sep = "")
+dim(textMatrix_int) <- dim(module_trait_cor_int)
+
+#Visualize interaction module-trait relationships with a heatmap and save as tiff for supplementary materials
+tiff("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Module_Trait_Relationships_Int.tiff", width = 1200, height = 1000, res = 100)
+par(mar = c(8, 10, 3, 3))
+labeledHeatmap(
+  Matrix = module_trait_cor_int,
+  xLabels = names(trait_data_int),
+  yLabels = names(module_eigengenes),
+  ySymbols = names(module_eigengenes),
+  colorLabels = FALSE,
+  colors = colorRampPalette(c("#1F1BB3", "white", "#D41159"))(50),
+  textMatrix = textMatrix_int,
+  setStdMargins = FALSE,
+  cex.text = 0.5,
+  zlim = c(-1, 1)
+)
+dev.off()
+```
+
+```{r, Module Eigengene Network}
+
+#Calculate correlation between module eigengenes
+me_correlation <- cor(module_eigengenes, use = "pairwise.complete.obs")
+ 
+#Calculate p-values
+me_pvalue <- corPvalueStudent(me_correlation, nSamples)
+ 
+#Create adjacency matrix: keep correlations > 0.5 and p < 0.05
+me_adjacency <- (abs(me_correlation) > 0.5) & (me_pvalue < 0.05)
+diag(me_adjacency) <- FALSE  # Remove self-connections
+ 
+#Check if there are any edges
+n_edges <- sum(me_adjacency) / 2
+cat("\nNumber of module pairs with |correlation| > 0.5 and p < 0.05:", n_edges, "\n")
+#Number of module pairs with |correlation| > 0.5 and p < 0.05: 56 (7/25/26) 
+ 
+if (n_edges == 0) {
+  cat("\nNo strong correlations between modules at |r| > 0.5.\n")
+  cat("Trying |r| > 0.3...\n\n")
+  me_adjacency <- (abs(me_correlation) > 0.3) & (me_pvalue < 0.05)
+  diag(me_adjacency) <- FALSE
+  n_edges <- sum(me_adjacency) / 2
+  correlation_threshold <- 0.3
+} else {
+  correlation_threshold <- 0.5
+}
+ 
+if (n_edges == 0) {
+  cat("No significant correlations between modules even at |r| > 0.3.\n")
+  cat("Modules are largely independent.\n")
+} else {
+  #Create network of module relationships
+  me_network <- graph_from_adjacency_matrix(
+    me_adjacency,
+    mode = "undirected"
+  )
+}
+ 
+  #Convert numeric module labels to color names
+  #module_names_numeric <- gsub("ME", "", names(module_eigengenes))
+  #module_names_colors <- labels2colors(as.numeric(module_names_numeric))
+  
+  #Plain module color names without ME (altered from source code because we changed the module names to colors previously for a nicer correlation map)
+  module_names_colors <- gsub("ME", "", names(module_eigengenes))
+ 
+  #cat("Module numeric labels:", head(module_names_numeric), "\n")
+  cat("Corresponding colors:", head(module_names_colors), "\n")
+ 
+  #Set vertex colors using the actual color names
+  V(me_network)$color <- module_names_colors
+ 
+  #Calculate node sizes based on module size
+  #Use color names to get counts from module_colors table
+  module_sizes_table <- table(module_colors)
+  module_sizes_net <- module_sizes_table[module_names_colors]
+ 
+  #Handle any missing values (modules with no genes)
+  module_sizes_net[is.na(module_sizes_net)] <- 10
+ 
+  node_sizes_me <- log10(as.numeric(module_sizes_net) + 1) * 10 + 10
+ 
+  #Plot module network
+if (n_edges > 0) {
+  png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Module_Eigengene_Network.png", width = 1000, height = 1000, res = 100)
+  par(mar = c(1, 1, 3, 1))
+  set.seed(123)
+  plot(me_network,
+       vertex.size = node_sizes_me,
+       vertex.label = module_names_colors,
+       vertex.label.cex = 0.7,
+       vertex.label.color = "black",
+       vertex.color = module_names_colors,
+       vertex.frame.color = "black",
+       edge.width = 3,
+       edge.color = "gray40",
+       layout = layout_with_fr(me_network),
+       main = paste0("Module Eigengene Network\n(|correlation| > ", 
+                     correlation_threshold, ", p < 0.05)"))
+  dev.off()
+}
+ 
+ 
+#Also show a correlation heatmap for reference
+#Use color names for row/column labels
+me_cor_labeled <- me_correlation
+rownames(me_cor_labeled) <- module_names_colors
+colnames(me_cor_labeled) <- module_names_colors
+
+png("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Module_Eigengene_Correlation_Heatmap.png", width = 1200, height = 1200, res = 100)
+pheatmap(
+  me_cor_labeled,
+  color = colorRampPalette(c("#1F1BB3", "white", "#D41159"))(50),
+  breaks = seq(-1, 1, length.out = 51),
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  main = "Module Eigengene Correlation Heatmap",
+  fontsize = 7
+)
+dev.off()
+```
+
+```{r, Module Membership Information}
+
+#Extracting kME (module eigengene connectivity) values for each gene in relation to each module
+module_kMEs <- cor(expr_matrix, module_eigengenes, use = "p")
+
+#Creating matrix which contains the kME values only for the genes part of each respective module
+membership_matrix <- module_kMEs
+module_numbers <- substring(colnames(membership_matrix), 3) #Removes ME from module names
+colnames(membership_matrix) <- module_numbers
+#Function to replace kME values for non corresponding genes and modules with NA
+for (i in seq_along(module_numbers)) {
+  membership_matrix[module_colors != module_numbers[i], i] <- NA}
+#Save as csv file
+write.csv(membership_matrix, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Tables/Module_Membership_kME.csv")
+
+#Making a table with the gene membership for each module
+module_gene_lists <- split(names(module_colors), module_colors)
+max_len <- max(lengths(module_gene_lists))
+
+module_membership <- data.frame(
+  lapply(module_gene_lists, function(x) c(x, rep(NA, max_len - length(x)))))
+#Save as csv file
+write.csv(module_membership, "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Tables/Module_Membership.csv")
+```
+
+```{r, Mean & Distribution of Module Eigengenes by Sample}
+
+#Create sample info with correct levels to be used
+sample_info <- chicken_phenodata_ab %>%
+  tibble::rownames_to_column("Sample") %>%
+  dplyr::mutate(
+    Chrom = factor(Chrom, levels = c("ZZ", "ZW")),
+    Treat = factor(Treat, levels = c("Sal", "Fad"))
+  )
+
+#Creating a data frame with module eigengene info for each sample
+ME_long <- module_eigengenes %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  select(-MEgrey) %>% #Taking out grey module because it is unassigned genes
+  left_join(
+    sample_info %>% select(Sample, Treat, Chrom, Chromosome_Treatment),
+    by = "Sample"
+  ) %>%
+  pivot_longer(
+    cols = starts_with("ME"),
+    names_to = "Module",
+    values_to = "Eigengene"
+  ) %>%
+  mutate(Module = sub("^ME", "", Module))
+
+#Function to make text light or dark based on background luminance (gamma corrected)
+text_color <- function(bg, cutoff = 0.2) {
+  rgb <- col2rgb(bg) / 255
+  rgb <- ifelse(rgb <= 0.03928, rgb/12.92, ((rgb+0.055)/1.055)^2.4)
+  luminance <- 0.2126 * rgb[1,] + 0.7152 * rgb[2,] + 0.0722 * rgb[3,]
+  ifelse(luminance < cutoff, "white", "black")
+}
+
+#Manually assigning colors to each module color so the headers can have corresponding colors
+module_colors_ME <- c("black","blue","brown","cyan","darkgreen","darkred","darkturquoise","green","greenyellow","grey60","lightcyan","lightgreen","lightyellow", "magenta","midnightblue","pink","purple", "red","royalblue","salmon","tan","turquoise","yellow")
+names(module_colors_ME) <- module_colors_ME
+fills <- module_colors_ME
+text_cols <- text_color(fills)
+rep_len_list <- function(x, n) rep(list(x), length(fills))
+
+#Making plot
+MEplot <- ggplot(
+  ME_long,aes(x = Treat, y = Eigengene, color = Chrom, group = Chrom)) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  ggh4x::facet_wrap2(
+    ~Module,
+    ncol = 8,
+    scales = "fixed",
+    strip = ggh4x::strip_themed(
+      background_x = ggh4x::elem_list_rect(fill = fills),
+      text_x = ggh4x::elem_list_text(
+        color = text_cols,
+        size = rep(8, length(fills)),
+        margin = rep_len_list(
+          ggplot2::margin(2, 2, 2, 2),
+          length(fills))))) +
+  scale_color_manual(
+    values = c(ZZ = "#FCA636", ZW = "#B12A90")) +
+  labs(x = "Treatment") +
+  theme_bw() +
+  theme(
+    # legend.position = "inside",
+    # legend.position.inside = c(0.9, 0.1),
+    # legend.background = element_rect(fill = "white", color = "black"),
+    # legend.key = element_rect(fill = "white"),
+    # legend.key.size = unit(0.2, "cm"),
+    # legend.title = element_text(face = "bold", size = 9),
+    # legend.text = element_text(size = 8),
+    legend.position = "none", #for the purpose of making pretty figures the legend has been removed, but the code for it is above
+    axis.title = element_text(face = "bold", size = 8),
+    axis.text = element_text(size = 8, color = "black")
+  )
+#Save as a pdf for export to illustrator
+pdf("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/ME_Distribution_Mean_Plot.pdf", width = 6.84, height = 2.5)
+par(ps = 8)
+MEplot
+dev.off()
+```
+
+```{r, Hub Gene Network/Coexpression}
+##Gather neccesary data
+
+#Directory to save everything to
+out_dir <- "~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA"
+
+#Need to assign module names
+names(module_colors) <- colnames(expr_matrix)
+
+#Top 1000 most variable genes
+top_genes_var <- names(sort(apply(expr_matrix, 2, var), decreasing = TRUE))[1:1000]
+
+#TOM on the subset
+tom_subset <- TOMsimilarity(
+  adjacency(expr_matrix[, top_genes_var], power = soft_power, type = "signed")
+)
+dimnames(tom_subset) <- list(top_genes_var, top_genes_var)
+
+#Helper: threshold TOM -> igraph object with module colors attached
+build_network <- function(tom, cutoff) {
+  tom[tom < cutoff] <- 0
+  g <- graph_from_adjacency_matrix(tom, mode = "undirected",
+                                   weighted = TRUE, diag = FALSE)
+  V(g)$color <- module_colors[V(g)$name]
+  V(g)$color[is.na(V(g)$color)] <- "grey"
+  g
+}
+
+##Network Visualization (base igraph, top 5% of connections)
+tom_threshold <- quantile(tom_subset[upper.tri(tom_subset)], 0.95)
+cat("TOM threshold (95th percentile):", tom_threshold, "\n")
+
+network_graph <- build_network(tom_subset, tom_threshold)
+node_sizes    <- log10(degree(network_graph) + 1) * 3 + 3
+
+#Save as png file
+png(file.path(out_dir, "WGCNA_Plots/Coexpression_Network.png"),
+    width = 1200, height = 1200, res = 100)
+par(mar = c(1, 1, 3, 1))
+set.seed(123)
+plot(network_graph,
+     vertex.size = node_sizes,
+     vertex.label = NA,
+     vertex.color = V(network_graph)$color,
+     vertex.frame.color = NA,
+     edge.width = 0.5,
+     edge.color = "gray80",
+     layout = layout_with_fr(network_graph),
+     main = "Co-expression Network\n(Top 1000 Variable Genes, Top 5% Connections)")
+
+legend_cols <- setdiff(unique(V(network_graph)$color), "grey")
+if (length(legend_cols) <= 10) {
+  legend("topright", legend = legend_cols, col = legend_cols,
+         pch = 19, cex = 0.7, title = "Modules", bty = "n")}
+dev.off()
+
+##Save the top 10 hub genes per module into a csv file
+top_n <- 10
+
+#Gene-name table
+module_gene_lists <- split(names(module_colors), module_colors)
+max_len <- max(lengths(module_gene_lists))
+module_gene_table <- data.frame(
+  lapply(module_gene_lists, function(x) c(x, rep(NA, max_len - length(x)))))
+
+#Rebuild kME, correlation of each gene with each module eigengene
+module_membership <- cor(expr_matrix, module_eigengenes, use = "pairwise.complete.obs")
+
+hub_gene_table <- as.data.frame(sapply(unique(module_colors), function(mod) {
+  genes <- names(module_colors)[module_colors == mod]
+  kme   <- module_membership[genes, paste0("ME", mod)]
+  hubs  <- names(sort(kme, decreasing = TRUE))[seq_len(min(top_n, length(kme)))]
+  c(hubs, rep(NA, top_n - length(hubs)))
+}))
+
+#Create csv
+write.csv(hub_gene_table, file.path(out_dir, "WGCNA_Tables/Hub_Genes_Table.csv"))
+
+library(tidygraph)
+##Co-expression plot for Illustrator (ggraph, edges with TOM >= 0.05)
+graph_tbl <- as_tbl_graph(build_network(tom_subset, 0.05)) %>%
+  mutate(size = centrality_degree(weights = weight))
+
+coexpression_plot <- ggraph(graph_tbl, layout = "fr", niter = 5000) +
+  geom_edge_link(alpha = 0.05, color = "grey") +
+  geom_node_point(aes(color = I(color), size = size)) +
+  scale_size_continuous(range = c(0.5, 5), name = "Connectivity") +
+  guides(size = guide_legend(direction = "horizontal", title.position = "top",
+                             label.position = "bottom", nrow = 1)) +
+  theme_void() +
+  theme(legend.position = "top",
+        legend.text  = element_text(size = 8),
+        legend.title = element_text(size = 9, face = "bold"))
+show(coexpression_plot)
+#Save as pdf
+ggsave(file.path(out_dir, "WGCNA_Plots/Co-expression_plot.pdf"),
+       coexpression_plot, width = 2.5, height = 3)
+```
+
+```{r, Chromosomal Distribution of Genes by Module}
+
+##Gathering information needed
+
+#Chromosome of each gene
+gene_chrom <- gene_data %>%
+  select(gene = symbols_ids, chr = chromosome_name)
+
+#Find distribution across each module
+module_chrom_list <- map(colnames(membership_matrix), function(mod) {
+  
+  #Get genes in this module
+  genes_in_module <- rownames(membership_matrix)[
+    !is.na(membership_matrix[, mod])
+  ]
+  
+  #Subset chromosome data
+  chrom_subset <- gene_chrom %>%
+    filter(gene %in% genes_in_module)
+  
+  #Count chromosomes
+  chrom_counts <- chrom_subset %>%
+    count(chr, name = "Freq") %>%
+    rename(Var1 = chr)
+  
+  list(chrom_counts = chrom_counts)
+})
+
+#Name the list
+names(module_chrom_list) <- colnames(membership_matrix)
+
+#Chromosome classification function
+classify_chrom <- function(chr) {
+  autosomes <- c("KZ626819.1","AADN05001218.1", as.character(1:38)) #These are genomic accession numbers for loci known to be on autosomes
+  z_chroms  <- c("Z", "AADN05001439.1")
+  w_chroms  <- c("W")
+  mitochondrial <- c("MT")
+  case_when(
+    chr %in% autosomes ~ "Autosomes",
+    chr %in% z_chroms  ~ "Z Chromosome",
+    chr %in% w_chroms  ~ "W Chromosome",
+    chr %in% mitochondrial ~ "Mitochondria",
+    TRUE ~ NA_character_   #Everything else ignored
+  )}
+
+#Define chromosomal categories
+categories <- c("Autosomes", "Z Chromosome", "W Chromosome", "Mitochondria")
+
+#Getting chrom data from each module
+chrom_list <- lapply(module_chrom_list, function(x) x$chrom_counts)
+
+#Run function on all consistently
+module_chrom_sums <- map(chrom_list, ~{
+  .x %>%
+    mutate(category = classify_chrom(Var1)) %>%
+    filter(!is.na(category)) %>%
+    group_by(category) %>%
+    summarise(total_genes = sum(Freq), .groups = "drop")%>%
+    complete(category = categories, fill = list(total_genes = 0))
+})
+
+#Collecting information in one place
+module_chrom_stats <- bind_rows(module_chrom_sums, .id = "module") %>%
+  pivot_wider(names_from = module, values_from = total_genes) %>%
+  tibble::column_to_rownames("category") %>%
+  as.matrix()
+
+#Shifting configuration for barplot
+module_chrom_df <- as.data.frame(module_chrom_stats) %>%
+  tibble::rownames_to_column("category") %>%
+  tidyr::pivot_longer(
+    cols = -category,
+    names_to = "module",
+    values_to = "total_genes"
+  )
+
+#Relevel so it's in the order I want
+module_chrom_df$category <- factor(
+  module_chrom_df$category,
+  levels = c("W Chromosome", "Z Chromosome", "Mitochondria", "Autosomes")
+)
+
+#Save as a pdf for export to illustrator
+pdf("~/Workspace/BIO-BIRDLAB/Shared/Chicken_Project/WGCNA/WGCNA_Plots/Module_Chromosome_Distribution.pdf", width = 4.5, height = 2.25)
+par(ps = 8) #mar = c(4, 3.5, 1, .25), ps = 8) 
+ggplot(module_chrom_df, aes(x = module, y = total_genes, fill = category)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(
+    values = c("Autosomes" = "#A4CE4C",
+               "Mitochondria" = "yellow",
+               "Z Chromosome" = "#FCA636",
+               "W Chromosome" = "#B12A90FF")) +
+  labs(
+    x = NULL,
+    y = "Total Genes",
+    fill = NULL) +
+  theme_classic() +
+  theme(
+    axis.text = element_text(angle = 35, hjust = 1, color = "black", size = 8),
+    axis.title = element_text(size = 8, face = "bold"),
+    legend.position = "none")
+dev.off()
+```
